@@ -207,6 +207,12 @@ static int parse_safetensors_file(const char* filename, TensorInfo** tensors, in
 // -----------------------------------------------------------------------------
 // Main conversion
 // -----------------------------------------------------------------------------
+// forward declarations for helper functions defined later
+static void write_kv_string(FILE* out, const char* key, const char* value);
+static void write_kv_uint32(FILE* out, const char* key, uint32_t value);
+static void write_tensor_info(FILE* out, const char* name, int64_t* shape, int n_dims,
+                              ggml_type dtype, uint64_t offset);
+
 int main(int argc, char* argv[]) {
     if (argc < 3 || argc > 4) {
         fprintf(stderr, "Usage: %s <model_dir> <output.gguf> [--f16]\n", argv[0]);

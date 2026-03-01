@@ -306,9 +306,19 @@ int main(int argc, char* argv[]) {
 
             // Parse each tensor in this file
             for (auto& [tensor_name, info] : header.items()) {
+                // Some entries like __metadata__ might not have dtype/shape
+                if (!info.contains("dtype") || !info["dtype"].is_string()) {
+                    std::cerr << "Skipping non-tensor entry: " << tensor_name << "\n";
+                    continue;
+                }
+                if (!info.contains("shape") || !info["shape"].is_array()) {
+                    std::cerr << "Skipping tensor with invalid shape: " << tensor_name << "\n";
+                    continue;
+                }
+
                 TensorInfo ti;
                 ti.name = tensor_name;
-                ti.dtype = info["dtype"];
+                ti.dtype = info["dtype"].get<std::string>();
                 ti.shape = info["shape"].get<std::vector<int64_t>>();
                 auto offsets = info["data_offsets"].get<std::vector<uint64_t>>();
                 ti.file_offset = offsets[0] + sizeof(header_len) + header_len; // absolute in file

@@ -12,8 +12,26 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, BinaryIO
 
-import numpy as np
+# ---------------------------------------------------------
+# dependency helpers: try to import and install if missing
+# ---------------------------------------------------------
+
+def _import_or_install(name: str, package: Optional[str] = None):
+    try:
+        return __import__(name)
+    except ImportError:
+        pkg = package or name
+        print(f"{name} not installed; attempting pip install {pkg}", file=sys.stderr)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        return __import__(name)
+
+import subprocess
+
+np = _import_or_install("numpy")
+safetensors = _import_or_install("safetensors")
 from safetensors import safe_open
+
+# from tqdm import tqdm is handled lazily later
 
 # -----------------------------------------------------------------------------
 # GGUF constants
@@ -94,11 +112,12 @@ def align(f: BinaryIO, alignment: int = GGUF_ALIGNMENT) -> None:
 # -----------------------------------------------------------------------------
 class TensorInfo:
     """Metadata about a tensor to be written."""
-    def __init__(self, name: str, shape: List[int], dtype: str, file_path: Path):
+    def __init__(self, name: str, shape: List[int], dtype: str, file_path: Path, offset: int = 0):
         self.name = name
         self.shape = shape
         self.dtype = dtype          # original safetensors dtype string
         self.file_path = file_path
+        self.offset = offset        # byte position inside the safetensors file
         self.data_size = self._compute_size()
 
     def _compute_size(self) -> int:
@@ -106,7 +125,11 @@ class TensorInfo:
         numel = 1
         for d in self.shape:
             numel *= d
-        return numel * ELEMENT_SIZE.get(self.dtype, 4)  # fallback to 4 bytes
+        # support BF16 explicitly (2 bytes per element)
+        if self.dtype == "BF16":
+            return numel * 2
+        # fallback to ELEMENT_SIZE mapping for F32/F16 or default 4
+        return numel * ELEMENT_SIZE.get(self.dtype, 4)
 
     def __repr__(self):
         return f"TensorInfo(name={self.name}, shape={self.shape}, dtype={self.dtype})"
@@ -121,6 +144,21 @@ def collect_tensors(model_dir: Path) -> List[TensorInfo]:
     """
     index_path = model_dir / "model.safetensors.index.json"
     safetensors_files = []
+
+    # helper to parse header for offsets
+    def parse_offsets(sf_path: Path) -> Dict[str, int]:
+        with open(sf_path, "rb") as f:
+            header_len = struct.unpack('<Q', f.read(8))[0]
+            header_json = f.read(header_len).decode('utf-8')
+        hdr = json.loads(header_json)
+        offs: Dict[str, int] = {}
+        for name, info in hdr.items():
+            # skip entries without data_offsets
+            if 'data_offsets' not in info:
+                continue
+            start = int(info['data_offsets'][0]) + 8 + header_len
+            offs[name] = start
+        return offs
 
     if index_path.exists():
         # Sharded model: read index to get file list
@@ -141,23 +179,25 @@ def collect_tensors(model_dir: Path) -> List[TensorInfo]:
     # Now gather tensor info from each file
     tensors = []
     for sf_path in safetensors_files:
+        # parse offsets to know where each tensor's bytes start
+        offsets_map = parse_offsets(sf_path)
         with safe_open(sf_path, framework="np") as sf:
             for key in sf.keys():
                 # Get metadata without loading data
                 shape = sf.get_slice(key).get_shape()
                 dtype = sf.get_slice(key).get_dtype()
-                # Convert numpy dtype to safetensors string (e.g., float32 -> "F32")
-                # safetensors uses strings like "F32", "F16", etc.
-                # The dtype from get_dtype() is a numpy dtype, we map back.
-                dtype_str = {
-                    np.float32: "F32",
-                    np.float16: "F16",
-                    # add other types if needed
-                }.get(dtype.type)
+                if isinstance(dtype, str):
+                    dtype_str = dtype
+                else:
+                    dtype_str = {
+                        np.float32: "F32",
+                        np.float16: "F16",
+                    }.get(dtype.type)
                 if dtype_str is None:
                     raise ValueError(f"Unsupported dtype {dtype} for tensor {key}")
 
-                tensors.append(TensorInfo(key, shape, dtype_str, sf_path))
+                offset = offsets_map.get(key, 0)
+                tensors.append(TensorInfo(key, shape, dtype_str, sf_path, offset))
 
     # Sort by name for deterministic order (optional but recommended)
     tensors.sort(key=lambda t: t.name)
@@ -229,14 +269,28 @@ def convert_and_write(tensors: List[TensorInfo], output_path: Path,
             print("Writing tensors... (install tqdm for progress bar)")
 
         for t, target in iterator:
-            # Load the tensor from safetensors
-            with safe_open(t.file_path, framework="np") as sf:
-                data = sf.get_tensor(t.name)  # numpy array
+            # Load the tensor data. BF16 is not supported by numpy, so we
+            # read bytes manually and convert to float32.
+            if t.dtype == "BF16":
+                # read raw bytes from the safetensors file without touching
+                # the outer output file handle.
+                with open(t.file_path, "rb") as in_f:
+                    in_f.seek(t.offset)
+                    buf = in_f.read(t.data_size)
+                arr = np.frombuffer(buf, dtype=np.uint16)
+                # convert bfloat16 -> float32 by shifting bits
+                data = (arr.astype(np.uint32) << 16).view(np.float32)
+                data = data.reshape(t.shape)
+            else:
+                with safe_open(t.file_path, framework="np") as sf:
+                    data = sf.get_tensor(t.name)
 
             # Convert if needed
             if target == "F16" and t.dtype == "F32":
                 data = data.astype(np.float16)
-            # For other dtypes, we assume they are already correct.
+            # For BF16 tensors we may want to quantize to F16 if requested
+            if target == "F16" and t.dtype == "BF16":
+                data = data.astype(np.float16)
 
             # Write raw bytes
             f.write(data.tobytes())
